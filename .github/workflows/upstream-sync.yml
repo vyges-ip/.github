@@ -273,6 +273,18 @@ jobs:
           6. For description: write a clear, technical 1-2 sentence summary
           7. Set maturity to "production" if from a known silicon-proven project (OpenTitan, Caliptra, CoralNPU), otherwise "rtl_verified"
           8. Populate ALL sections: interfaces, parameters, performance, architecture, dependencies, test, artifacts, categories, trust
+          9. CRITICAL — categories MUST use the Vyges canonical taxonomy. main_category MUST be EXACTLY one of these 14:
+             "Analog & Mixed-Signal", "Arithmetic Units", "Base Libraries", "Chiplet Integration",
+             "Control Logic", "Converters", "Interface Controllers", "Memory Subsystems",
+             "Miscellaneous", "Processing Cores", "Security IP", "Signal Processing",
+             "Timing & Clocking", "Verification & Testing"
+             sub_category must match the main_category. Examples:
+             - Security IP: "Crypto Engines", "Fuse Controllers", "Secure Boot Blocks", "True Random Number Generators (TRNG)"
+             - Processing Cores: "RISC-V", "Co-Processors", "Vector Processors", "Custom ISAs"
+             - Interface Controllers: "Serial Interfaces", "High-Speed Interfaces", "Parallel Interfaces"
+             - Base Libraries: "Crossbars", "Arbiters", "Counters & Timers", "Pipeline & Bypass Logic"
+             - Signal Processing: "Transforms", "Filters", "Codecs"
+             - Memory Subsystems: "SRAM Controllers", "FIFOs & Buffers", "Flash Interfaces", "Cache Subsystems"
 
           Use this JSON structure (all fields required):
           {
@@ -299,7 +311,8 @@ jobs:
             "test": {"testbenches": [], "status": "upstream_passing", "coverage": "functional"},
             "documentation": {"upstream": "<url>"},
             "artifacts": {"total_rtl_lines": <number>},
-            "categories": {"primary": "<category>", "secondary": [], "tags": []},
+            "categories": [{"main_category": "<one of 14 canonical categories>", "sub_category": "<matching subcategory>"}],
+            "keywords": ["<tag1>", "<tag2>"],
             "trust": {"verification_level": "silicon_proven|simulation_passing", "tapeout_count": 0, "fpga_validated": false, "formal_verified": false, "maintained": true, "last_activity": "<date>"},
             "meta": {"template": {"generator": "github-models-ai", "template_version": "1.0.0", "generated_at": "<ISO8601>"}, "schema": {"version": "1.0.0"}}
           }
@@ -377,7 +390,7 @@ jobs:
                 "interfaces": [],
                 "parameters": [],
                 "architecture": {"type": "peripheral", "features": []},
-                "categories": {"primary": "uncategorized", "secondary": [], "tags": []},
+                "categories": [{"main_category": "Miscellaneous", "sub_category": "Custom Accelerators"}],
                 "trust": {"verification_level": "unknown", "maintained": true},
                 "_note": "AI enrichment failed. Manual population needed.",
                 "meta": {"template": {"generator": "upstream-sync-fallback", "generated_at": $timestamp}, "schema": {"version": "1.0.0"}}
@@ -400,7 +413,7 @@ jobs:
           fi
 
           echo "Metadata generation complete"
-          cat vyges-metadata.json | jq '.name, .maturity, .categories.primary' 2>/dev/null
+          cat vyges-metadata.json | jq '.name, .maturity, .categories[0].main_category' 2>/dev/null
 
       - name: Generate README if missing
         if: steps.check.outputs.needs_sync == 'true'
@@ -482,5 +495,5 @@ jobs:
           if [[ -f vyges-metadata.json ]]; then
             echo "| IP Name | $(jq -r '.name' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
             echo "| Maturity | $(jq -r '.maturity' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
-            echo "| Category | $(jq -r '.categories.primary' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Category | $(jq -r '.categories[0].main_category' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
           fi
