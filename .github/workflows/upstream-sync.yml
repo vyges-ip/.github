@@ -1,0 +1,492 @@
+name: Upstream Sync + AI Metadata
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Weekly on Monday at 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_metadata:
+        description: 'Force regenerate vyges-metadata.json even if it exists'
+        required: false
+        default: 'false'
+        type: boolean
+  push:
+    paths:
+      - 'upstream.yaml'
+      - '.github/workflows/upstream-sync.yml'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      models: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Read upstream.yaml
+        id: upstream
+        run: |
+          if [[ ! -f upstream.yaml ]]; then
+            echo "Error: upstream.yaml not found"
+            exit 1
+          fi
+          TYPE=$(yq eval '.upstream.type' upstream.yaml)
+          if [[ "$TYPE" == "standalone" ]]; then
+            echo "repo=$(yq eval '.upstream.repo' upstream.yaml)" >> $GITHUB_OUTPUT
+          else
+            echo "repo=$(yq eval '.upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
+          fi
+          echo "type=$TYPE" >> $GITHUB_OUTPUT
+          echo "branch=$(yq eval '.upstream.branch // "main"' upstream.yaml)" >> $GITHUB_OUTPUT
+          echo "commit=$(yq eval '.upstream.commit' upstream.yaml)" >> $GITHUB_OUTPUT
+          echo "path=$(yq eval '.upstream.path // ""' upstream.yaml)" >> $GITHUB_OUTPUT
+
+      - name: Check if sync needed
+        id: check
+        run: |
+          # Check if repo has synced content
+          if [[ ! -d rtl ]] && [[ ! -f LICENSE ]]; then
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            echo "sync_type=initial" >> $GITHUB_OUTPUT
+          else
+            # Clone and check for updates
+            rm -rf /tmp/upstream
+            git clone --quiet "${{ steps.upstream.outputs.repo }}" /tmp/upstream
+            cd /tmp/upstream
+            git checkout "${{ steps.upstream.outputs.branch }}" --quiet 2>/dev/null || true
+            LATEST=$(git rev-parse HEAD)
+            CURRENT="${{ steps.upstream.outputs.commit }}"
+            echo "latest=$LATEST" >> $GITHUB_OUTPUT
+            if [[ "$CURRENT" == "$LATEST" ]]; then
+              echo "needs_sync=false" >> $GITHUB_OUTPUT
+              echo "sync_type=none" >> $GITHUB_OUTPUT
+            else
+              echo "needs_sync=true" >> $GITHUB_OUTPUT
+              echo "sync_type=update" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Clone upstream
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          if [[ ! -d /tmp/upstream ]]; then
+            rm -rf /tmp/upstream
+            git clone --quiet "${{ steps.upstream.outputs.repo }}" /tmp/upstream
+          fi
+          cd /tmp/upstream
+          if [[ "${{ steps.check.outputs.sync_type }}" == "initial" ]]; then
+            git checkout "${{ steps.upstream.outputs.commit }}" --quiet
+          else
+            git checkout "${{ steps.check.outputs.latest }}" --quiet
+          fi
+
+      - name: Sync upstream files
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          UPSTREAM_TYPE="${{ steps.upstream.outputs.type }}"
+          UPSTREAM_PATH="${{ steps.upstream.outputs.path }}"
+
+          # Determine source directory
+          if [[ "$UPSTREAM_TYPE" == "monorepo" ]] && [[ -n "$UPSTREAM_PATH" ]]; then
+            SRC_BASE="/tmp/upstream/$UPSTREAM_PATH"
+          else
+            SRC_BASE="/tmp/upstream"
+          fi
+
+          # Process RTL imports
+          RTL_COUNT=$(yq eval '.import.rtl | length' upstream.yaml)
+          for ((i=0; i<$RTL_COUNT; i++)); do
+            UP_PATH=$(yq eval ".import.rtl[$i].path" upstream.yaml)
+            LOCAL_PATH=$(yq eval ".import.rtl[$i].map_to" upstream.yaml)
+            echo "Syncing RTL: $UP_PATH -> $LOCAL_PATH"
+            mkdir -p "$LOCAL_PATH"
+            if [[ "$UPSTREAM_TYPE" == "monorepo" ]]; then
+              cp -r "$SRC_BASE/$UP_PATH"/* "$LOCAL_PATH/" 2>/dev/null || \
+              cp -r "/tmp/upstream/$UP_PATH"/* "$LOCAL_PATH/" 2>/dev/null || true
+            else
+              cp -r "$SRC_BASE/$UP_PATH"/* "$LOCAL_PATH/" 2>/dev/null || true
+            fi
+          done
+
+          # Process license
+          if yq eval '.import.license' upstream.yaml | grep -q "path"; then
+            LIC_COUNT=$(yq eval '.import.license | length' upstream.yaml)
+            for ((i=0; i<$LIC_COUNT; i++)); do
+              UP_PATH=$(yq eval ".import.license[$i].path" upstream.yaml)
+              cp "/tmp/upstream/$UP_PATH" . 2>/dev/null || \
+              cp "$SRC_BASE/$UP_PATH" . 2>/dev/null || true
+            done
+          fi
+
+          # Process readme
+          if yq eval '.import.readme' upstream.yaml | grep -q "path"; then
+            README_COUNT=$(yq eval '.import.readme | length' upstream.yaml)
+            for ((i=0; i<$README_COUNT; i++)); do
+              UP_PATH=$(yq eval ".import.readme[$i].path" upstream.yaml)
+              cp "/tmp/upstream/$UP_PATH" . 2>/dev/null || \
+              cp "$SRC_BASE/$UP_PATH" . 2>/dev/null || true
+            done
+          fi
+
+          # Update commit hash for update syncs
+          if [[ "${{ steps.check.outputs.sync_type }}" == "update" ]]; then
+            yq eval ".upstream.commit = \"${{ steps.check.outputs.latest }}\"" -i upstream.yaml
+          fi
+
+          echo "Synced from upstream"
+
+      - name: Fetch metadata schema from private repo
+        id: schema
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch the full vyges-metadata schema from our private org repo
+          # This gives the AI the complete field definitions without exposing the schema publicly
+          gh api repos/vyges-ip/vyges-ip-internal/contents/vyges-metadata.schema.json \
+            -H "Accept: application/vnd.github.raw" > /tmp/vyges-metadata.schema.json 2>/dev/null || true
+
+          if [[ -f /tmp/vyges-metadata.schema.json ]] && [[ -s /tmp/vyges-metadata.schema.json ]]; then
+            echo "has_schema=true" >> $GITHUB_OUTPUT
+            echo "Schema fetched ($(wc -c < /tmp/vyges-metadata.schema.json) bytes)"
+            # Extract just the required fields and property names for the AI prompt (keep it compact)
+            jq '{required, properties: (.properties | keys)}' /tmp/vyges-metadata.schema.json > /tmp/schema_summary.json 2>/dev/null || true
+          else
+            echo "has_schema=false" >> $GITHUB_OUTPUT
+            echo "Warning: Could not fetch schema, will use built-in template"
+          fi
+
+      - name: Check metadata state
+        id: metadata
+        run: |
+          FORCE="${{ github.event.inputs.force_metadata || 'false' }}"
+          if [[ -f vyges-metadata.json ]] && [[ "$FORCE" != "true" ]]; then
+            # Check if it's just a skeleton (has _note field or maturity=draft with empty interfaces)
+            IS_SKELETON=$(jq -r 'if (._note != null) or (.maturity == "draft" and (.interfaces | length) == 0) then "true" else "false" end' vyges-metadata.json)
+            if [[ "$IS_SKELETON" == "true" ]]; then
+              echo "state=skeleton" >> $GITHUB_OUTPUT
+              echo "needs_enrichment=true" >> $GITHUB_OUTPUT
+            else
+              echo "state=enriched" >> $GITHUB_OUTPUT
+              echo "needs_enrichment=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "state=missing" >> $GITHUB_OUTPUT
+            echo "needs_enrichment=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Gather RTL context for AI
+        if: steps.metadata.outputs.needs_enrichment == 'true' || steps.check.outputs.needs_sync == 'true'
+        id: rtl_context
+        run: |
+          # Collect top-level module ports, packages, and file listing for AI analysis
+          CONTEXT_FILE="/tmp/rtl_context.txt"
+
+          echo "=== REPOSITORY ===" > "$CONTEXT_FILE"
+          echo "Name: $(echo '${{ github.repository }}' | cut -d'/' -f2)" >> "$CONTEXT_FILE"
+          echo "Org: vyges-ip" >> "$CONTEXT_FILE"
+          echo "" >> "$CONTEXT_FILE"
+
+          echo "=== UPSTREAM ===" >> "$CONTEXT_FILE"
+          echo "Source: ${{ steps.upstream.outputs.repo }}" >> "$CONTEXT_FILE"
+          echo "Commit: ${{ steps.upstream.outputs.commit }}" >> "$CONTEXT_FILE"
+          echo "License: $(yq eval '.license.spdx // "Apache-2.0"' upstream.yaml)" >> "$CONTEXT_FILE"
+          echo "" >> "$CONTEXT_FILE"
+
+          echo "=== RTL FILES ===" >> "$CONTEXT_FILE"
+          find rtl -name "*.sv" -o -name "*.v" -o -name "*.svh" 2>/dev/null | sort >> "$CONTEXT_FILE"
+          echo "" >> "$CONTEXT_FILE"
+
+          echo "=== LINE COUNTS ===" >> "$CONTEXT_FILE"
+          find rtl -name "*.sv" -o -name "*.v" 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 >> "$CONTEXT_FILE"
+          echo "" >> "$CONTEXT_FILE"
+
+          # Extract top-level module (largest .sv file or file matching repo name)
+          IP_NAME=$(echo '${{ github.repository }}' | cut -d'/' -f2)
+          TOP_FILE=""
+          # Try exact name match first
+          for f in $(find rtl -maxdepth 2 -name "*.sv" | sort); do
+            base=$(basename "$f" .sv)
+            if [[ "$base" == "$IP_NAME" ]] || [[ "$base" == "${IP_NAME//-/_}" ]]; then
+              TOP_FILE="$f"
+              break
+            fi
+          done
+          # Fallback: file with _top or _ctrl suffix, or just the largest
+          if [[ -z "$TOP_FILE" ]]; then
+            TOP_FILE=$(find rtl -maxdepth 2 -name "*_top.sv" -o -name "*_ctrl.sv" | head -1)
+          fi
+          if [[ -z "$TOP_FILE" ]]; then
+            TOP_FILE=$(find rtl -maxdepth 2 -name "*.sv" | xargs wc -l 2>/dev/null | sort -n | tail -2 | head -1 | awk '{print $2}')
+          fi
+
+          if [[ -n "$TOP_FILE" ]] && [[ -f "$TOP_FILE" ]]; then
+            echo "=== TOP-LEVEL MODULE ($TOP_FILE) ===" >> "$CONTEXT_FILE"
+            head -200 "$TOP_FILE" >> "$CONTEXT_FILE"
+            echo "" >> "$CONTEXT_FILE"
+          fi
+
+          # Extract package files (parameters, types)
+          for pkg in $(find rtl -maxdepth 2 -name "*_pkg.sv" -o -name "*_defines*.sv" -o -name "*_param*.sv" | head -5); do
+            echo "=== PACKAGE ($pkg) ===" >> "$CONTEXT_FILE"
+            head -150 "$pkg" >> "$CONTEXT_FILE"
+            echo "" >> "$CONTEXT_FILE"
+          done
+
+          # Include README if present
+          if [[ -f README.md ]]; then
+            echo "=== README.md (first 100 lines) ===" >> "$CONTEXT_FILE"
+            head -100 README.md >> "$CONTEXT_FILE"
+          fi
+
+          # Truncate to ~12K chars to fit in LLM context
+          head -c 12000 "$CONTEXT_FILE" > /tmp/rtl_context_trimmed.txt
+          mv /tmp/rtl_context_trimmed.txt "$CONTEXT_FILE"
+
+          echo "context_file=$CONTEXT_FILE" >> $GITHUB_OUTPUT
+          echo "RTL context gathered ($(wc -c < $CONTEXT_FILE) bytes)"
+
+      - name: Generate gold-standard metadata via AI
+        if: steps.metadata.outputs.needs_enrichment == 'true' || (steps.check.outputs.needs_sync == 'true' && !contains(steps.metadata.outputs.state, 'enriched'))
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IP_NAME=$(echo '${{ github.repository }}' | cut -d'/' -f2)
+          RTL_CONTEXT=$(cat /tmp/rtl_context.txt)
+          LICENSE_SPDX=$(yq eval '.license.spdx // "Apache-2.0"' upstream.yaml)
+          UPSTREAM_REPO="${{ steps.upstream.outputs.repo }}"
+          UPSTREAM_COMMIT="${{ steps.upstream.outputs.commit }}"
+          UPSTREAM_PATH="${{ steps.upstream.outputs.path }}"
+
+          # Build the prompt
+          PROMPT=$(cat <<'PROMPT_END'
+          You are an expert silicon IP engineer. Analyze the RTL source code context below and generate a comprehensive vyges-metadata.json file.
+
+          IMPORTANT RULES:
+          1. Output ONLY valid JSON — no markdown, no code fences, no explanation
+          2. Every field must be accurate based on the RTL analysis
+          3. For interfaces: extract actual port names, protocols (TL-UL, AHB-Lite, AXI, etc.), widths, and directions from the module ports
+          4. For parameters: extract actual parameter names, types, defaults, and ranges from the module declaration
+          5. For architecture.features: describe the actual functionality based on the code
+          6. For description: write a clear, technical 1-2 sentence summary
+          7. Set maturity to "production" if from a known silicon-proven project (OpenTitan, Caliptra, CoralNPU), otherwise "rtl_verified"
+          8. Populate ALL sections: interfaces, parameters, performance, architecture, dependencies, test, artifacts, categories, trust
+
+          Use this JSON structure (all fields required):
+          {
+            "$schema": "https://vyges.com/schema/v1/vyges-metadata.schema.json",
+            "x-version": "1.0.0",
+            "name": "<ip-name>",
+            "version": "0.1.0",
+            "description": "<technical description>",
+            "license": "<SPDX>",
+            "maturity": "production|rtl_verified|prototype",
+            "target": ["asic", "fpga"],
+            "design_type": ["digital"],
+            "created": "<ISO8601>",
+            "updated": "<ISO8601>",
+            "source": {"type": "git", "url": "<upstream-url>", "commit": "<hash>", "ip_path": "<path>", "private": false, "containsEncryptedPayload": false, "indexing": true},
+            "maintainers": [{"name": "Vyges", "email": "team@vyges.com", "url": "https://vyges.com", "github": "vyges"}],
+            "interfaces": [{"type": "bus|clock|reset|interrupt|...", "direction": "input|output|slave|master|both", "protocol": "<protocol>", "port": "<port_name>", "width": <bits>, "description": "<desc>"}],
+            "parameters": [{"name": "<param>", "type": "int|bit|enum", "default": <value>, "description": "<desc>"}],
+            "performance": {},
+            "architecture": {"type": "peripheral|processor|coprocessor|memory|bus", "features": ["<feature1>", "<feature2>"]},
+            "asic": {"flavor": "digital", "technology": ["sky130A"]},
+            "fpga": {"toolchain": ["Vivado"], "devices": ["Artix-7"]},
+            "dependencies": [{"name": "<dep>", "type": "library|core|bus|integration", "description": "<desc>"}],
+            "test": {"testbenches": [], "status": "upstream_passing", "coverage": "functional"},
+            "documentation": {"upstream": "<url>"},
+            "artifacts": {"total_rtl_lines": <number>},
+            "categories": {"primary": "<category>", "secondary": [], "tags": []},
+            "trust": {"verification_level": "silicon_proven|simulation_passing", "tapeout_count": 0, "fpga_validated": false, "formal_verified": false, "maintained": true, "last_activity": "<date>"},
+            "meta": {"template": {"generator": "github-models-ai", "template_version": "1.0.0", "generated_at": "<ISO8601>"}, "schema": {"version": "1.0.0"}}
+          }
+          PROMPT_END
+          )
+
+          # Prepare the request with variable substitution
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Include schema summary if available
+          SCHEMA_CONTEXT=""
+          if [[ -f /tmp/schema_summary.json ]]; then
+            SCHEMA_CONTEXT="
+
+          SCHEMA REQUIRED FIELDS: $(cat /tmp/schema_summary.json)
+
+          The vyges-metadata.schema.json is defined at https://vyges.com/schema/v1/vyges-metadata.schema.json
+          Vyges IP Catalog (https://vyges.com) is a silicon IP marketplace. Populate metadata thoroughly."
+          fi
+
+          SYSTEM_MSG="You generate vyges-metadata.json for silicon IP blocks in the Vyges IP Catalog (https://vyges.com). Output ONLY valid JSON. IP name: $IP_NAME. License: $LICENSE_SPDX. Upstream: $UPSTREAM_REPO commit $UPSTREAM_COMMIT path $UPSTREAM_PATH. Timestamp: $TIMESTAMP. Date: $TODAY.$SCHEMA_CONTEXT"
+
+          USER_MSG="$PROMPT
+
+          RTL CONTEXT:
+          $RTL_CONTEXT"
+
+          # Call GitHub Models API (free for public repos)
+          RESPONSE=$(curl -s -X POST \
+            "https://models.inference.ai.azure.com/chat/completions" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_MSG" \
+              --arg user "$USER_MSG" \
+              '{
+                "model": "gpt-4o",
+                "messages": [
+                  {"role": "system", "content": $system},
+                  {"role": "user", "content": $user}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4000
+              }')")
+
+          # Extract the JSON content from the response
+          AI_OUTPUT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+
+          if [[ -z "$AI_OUTPUT" ]]; then
+            echo "Warning: AI enrichment failed, generating skeleton instead"
+            echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
+
+            # Fallback: generate basic skeleton
+            jq -n \
+              --arg name "$IP_NAME" \
+              --arg license "$LICENSE_SPDX" \
+              --arg upstream_repo "$UPSTREAM_REPO" \
+              --arg upstream_commit "$UPSTREAM_COMMIT" \
+              --arg timestamp "$TIMESTAMP" \
+              '{
+                "$schema": "https://vyges.com/schema/v1/vyges-metadata.schema.json",
+                "x-version": "1.0.0",
+                "name": $name,
+                "version": "0.1.0",
+                "description": ("IP imported from " + $upstream_repo),
+                "license": $license,
+                "maturity": "draft",
+                "target": ["asic", "fpga"],
+                "design_type": ["digital"],
+                "created": $timestamp,
+                "updated": $timestamp,
+                "source": {"type": "git", "url": $upstream_repo, "commit": $upstream_commit, "private": false, "indexing": true},
+                "maintainers": [{"name": "Vyges", "email": "team@vyges.com", "github": "vyges"}],
+                "interfaces": [],
+                "parameters": [],
+                "architecture": {"type": "peripheral", "features": []},
+                "categories": {"primary": "uncategorized", "secondary": [], "tags": []},
+                "trust": {"verification_level": "unknown", "maintained": true},
+                "_note": "AI enrichment failed. Manual population needed.",
+                "meta": {"template": {"generator": "upstream-sync-fallback", "generated_at": $timestamp}, "schema": {"version": "1.0.0"}}
+              }' > vyges-metadata.json
+          else
+            # Strip markdown code fences if present
+            CLEAN_JSON=$(echo "$AI_OUTPUT" | sed '/^```/d')
+
+            # Validate JSON
+            if echo "$CLEAN_JSON" | jq . > /dev/null 2>&1; then
+              echo "$CLEAN_JSON" | jq '.' > vyges-metadata.json
+              echo "AI-generated gold-standard metadata written"
+            else
+              echo "Warning: AI output was not valid JSON, saving raw and falling back"
+              echo "$AI_OUTPUT" > /tmp/ai_raw_output.txt
+              # Try to extract JSON from the output
+              echo "$AI_OUTPUT" | grep -Pzo '\{[\s\S]*\}' | head -1 | jq '.' > vyges-metadata.json 2>/dev/null || \
+              echo '{"_error": "AI output was not valid JSON", "maturity": "draft"}' > vyges-metadata.json
+            fi
+          fi
+
+          echo "Metadata generation complete"
+          cat vyges-metadata.json | jq '.name, .maturity, .categories.primary' 2>/dev/null
+
+      - name: Generate README if missing
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          if [[ ! -f README.md ]] && [[ -f vyges-metadata.json ]]; then
+            IP_NAME=$(jq -r '.name' vyges-metadata.json)
+            DESCRIPTION=$(jq -r '.description' vyges-metadata.json)
+            LICENSE=$(jq -r '.license' vyges-metadata.json)
+            UPSTREAM=$(jq -r '.source.url // empty' vyges-metadata.json)
+
+            cat > README.md <<EOF
+          # $IP_NAME
+
+          $DESCRIPTION
+
+          ## Upstream
+
+          Imported from [$UPSTREAM]($UPSTREAM). See \`upstream.yaml\` for commit tracking.
+
+          ## Metadata
+
+          See \`vyges-metadata.json\` for complete IP specification including interfaces, parameters, and architecture details.
+
+          ## License
+
+          $LICENSE — see [LICENSE](LICENSE).
+          EOF
+            echo "Generated README.md"
+          fi
+
+      - name: Commit changes
+        if: steps.check.outputs.needs_sync == 'true' || steps.metadata.outputs.needs_enrichment == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            BRANCH=$(git branch --show-current || echo "main")
+            git add .
+
+            SYNC_TYPE="${{ steps.check.outputs.sync_type }}"
+            if [[ "$SYNC_TYPE" == "initial" ]]; then
+              MSG="Initial upstream sync + AI metadata generation
+
+          Synced RTL from ${{ steps.upstream.outputs.repo }}
+          Commit: ${{ steps.upstream.outputs.commit }}
+          Metadata generated via GitHub Models (gpt-4o)"
+            elif [[ "$SYNC_TYPE" == "update" ]]; then
+              MSG="Upstream sync: ${{ steps.check.outputs.latest }}
+
+          Updated from ${{ steps.upstream.outputs.commit }}
+          Metadata refreshed via GitHub Models"
+            else
+              MSG="AI metadata enrichment
+
+          Generated gold-standard vyges-metadata.json via GitHub Models (gpt-4o)"
+            fi
+
+            git commit -m "$MSG"
+            git push origin "$BRANCH"
+            echo "Changes committed and pushed"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Upstream Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | \`${{ github.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Upstream | \`${{ steps.upstream.outputs.repo }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sync Type | ${{ steps.check.outputs.sync_type || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Metadata | ${{ steps.metadata.outputs.state || 'n/a' }} |" >> $GITHUB_STEP_SUMMARY
+          if [[ -f vyges-metadata.json ]]; then
+            echo "| IP Name | $(jq -r '.name' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Maturity | $(jq -r '.maturity' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Category | $(jq -r '.categories.primary' vyges-metadata.json) |" >> $GITHUB_STEP_SUMMARY
+          fi
