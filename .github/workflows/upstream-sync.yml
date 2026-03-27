@@ -1,19 +1,13 @@
-name: Upstream Sync + AI Metadata
+name: Upstream Sync + AI Metadata (Reusable)
 
 on:
-  schedule:
-    - cron: '0 0 * * 1'  # Weekly on Monday at 00:00 UTC
-  workflow_dispatch:
+  workflow_call:
     inputs:
       force_metadata:
         description: 'Force regenerate vyges-metadata.json even if it exists'
         required: false
-        default: 'false'
+        default: false
         type: boolean
-  push:
-    paths:
-      - 'upstream.yaml'
-      - '.github/workflows/upstream-sync.yml'
 
 jobs:
   sync:

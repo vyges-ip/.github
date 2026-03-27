@@ -1,0 +1,6 @@
+{
+  "name": "Vyges IP Upstream Sync",
+  "description": "Syncs RTL from upstream repo and generates gold-standard vyges-metadata.json via AI. Just add upstream.yaml to your repo.",
+  "iconName": "cloud-download",
+  "categories": ["Continuous integration"]
+}
