@@ -162,7 +162,16 @@ jobs:
         id: metadata
         run: |
           FORCE="${{ github.event.inputs.force_metadata || 'false' }}"
-          if [[ -f vyges-metadata.json ]] && [[ "$FORCE" != "true" ]]; then
+          # Check if metadata is locked (gold-standard, do not overwrite with AI)
+          LOCKED="false"
+          if [[ -f upstream.yaml ]]; then
+            LOCKED=$(yq eval '.metadata_locked // false' upstream.yaml)
+          fi
+          if [[ "$LOCKED" == "true" ]] && [[ "$FORCE" != "true" ]]; then
+            echo "Metadata is locked (metadata_locked: true in upstream.yaml). Skipping AI generation."
+            echo "state=locked" >> $GITHUB_OUTPUT
+            echo "needs_enrichment=false" >> $GITHUB_OUTPUT
+          elif [[ -f vyges-metadata.json ]] && [[ "$FORCE" != "true" ]]; then
             # Check if it's just a skeleton (has _note field or maturity=draft with empty interfaces)
             IS_SKELETON=$(jq -r 'if (._note != null) or (.maturity == "draft" and (.interfaces | length) == 0) then "true" else "false" end' vyges-metadata.json)
             if [[ "$IS_SKELETON" == "true" ]]; then
