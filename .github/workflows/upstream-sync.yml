@@ -34,7 +34,7 @@ jobs:
           fi
           TYPE=$(yq eval '.upstream.type' upstream.yaml)
           if [[ "$TYPE" == "standalone" ]]; then
-            echo "repo=$(yq eval '.upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
+            echo "repo=$(yq eval '.upstream.repo' upstream.yaml)" >> $GITHUB_OUTPUT
           else
             echo "repo=$(yq eval '.upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
           fi
@@ -77,7 +77,7 @@ jobs:
           fi
           cd /tmp/upstream
           if [[ "${{ steps.check.outputs.sync_type }}" == "initial" ]]; then
-            git checkout "${{ steps.upstream.outputs.commit }}" --quiet
+            COMMIT="${{ steps.upstream.outputs.commit }}"; if [[ "$COMMIT" != "null" && -n "$COMMIT" ]]; then git checkout "$COMMIT" --quiet; else echo "No pinned commit — using HEAD of branch"; fi
           else
             git checkout "${{ steps.check.outputs.latest }}" --quiet
           fi
