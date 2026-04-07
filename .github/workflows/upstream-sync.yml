@@ -34,9 +34,9 @@ jobs:
           fi
           TYPE=$(yq eval '.upstream.type' upstream.yaml)
           if [[ "$TYPE" == "standalone" ]]; then
-            echo "repo=$(yq eval '.upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
+            echo "repo=$(yq eval '.upstream.repo // .upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
           else
-            echo "repo=$(yq eval '.upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
+            echo "repo=$(yq eval '.upstream.repo // .upstream.source' upstream.yaml)" >> $GITHUB_OUTPUT
           fi
           echo "type=$TYPE" >> $GITHUB_OUTPUT
           echo "branch=$(yq eval '.upstream.branch // "main"' upstream.yaml)" >> $GITHUB_OUTPUT
