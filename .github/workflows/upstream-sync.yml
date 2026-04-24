@@ -131,6 +131,21 @@ jobs:
             done
           fi
 
+          # Process metadata (mirrors upstream's vyges-metadata.json verbatim when
+          # declared). Required for Vyges-owned IPs where canonical vyges/<repo>
+          # is the source of truth and AI regeneration would strip Vyges-specific
+          # fields (protocol_level, interfaces[].signals, etc.). Paired with
+          # metadata_locked: true in upstream.yaml to gate the AI step below.
+          if yq eval '.import.metadata' upstream.yaml | grep -q "path"; then
+            META_COUNT=$(yq eval '.import.metadata | length' upstream.yaml)
+            for ((i=0; i<$META_COUNT; i++)); do
+              UP_PATH=$(yq eval ".import.metadata[$i].path" upstream.yaml)
+              echo "Syncing metadata: $UP_PATH"
+              cp "/tmp/upstream/$UP_PATH" . 2>/dev/null || \
+              cp "$SRC_BASE/$UP_PATH" . 2>/dev/null || true
+            done
+          fi
+
           # Update commit hash for update syncs
           if [[ "${{ steps.check.outputs.sync_type }}" == "update" ]]; then
             yq eval ".upstream.commit = \"${{ steps.check.outputs.latest }}\"" -i upstream.yaml
@@ -187,7 +202,7 @@ jobs:
           fi
 
       - name: Gather RTL context for AI
-        if: steps.metadata.outputs.needs_enrichment == 'true' || steps.check.outputs.needs_sync == 'true'
+        if: steps.metadata.outputs.state != 'locked' && (steps.metadata.outputs.needs_enrichment == 'true' || steps.check.outputs.needs_sync == 'true')
         id: rtl_context
         run: |
           # Collect top-level module ports, packages, and file listing for AI analysis
@@ -258,7 +273,7 @@ jobs:
           echo "RTL context gathered ($(wc -c < $CONTEXT_FILE) bytes)"
 
       - name: Generate gold-standard metadata via AI
-        if: steps.metadata.outputs.needs_enrichment == 'true' || (steps.check.outputs.needs_sync == 'true' && !contains(steps.metadata.outputs.state, 'enriched'))
+        if: steps.metadata.outputs.state != 'locked' && (steps.metadata.outputs.needs_enrichment == 'true' || (steps.check.outputs.needs_sync == 'true' && !contains(steps.metadata.outputs.state, 'enriched')))
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
