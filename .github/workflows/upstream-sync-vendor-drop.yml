@@ -1,0 +1,281 @@
+name: Upstream Sync (vendor_drop, Reusable)
+
+# Reusable workflow for vyges-ip mirrors of pre-hardened vendor bundles
+# (ChipFoundry CF_SRAM family, foundry IO cells, vendor analog blocks,
+# customer NDA macros). Companion to the standalone/monorepo upstream-sync.yml
+# but specialized for the vendor_drop type defined in upstream-yaml-schema:
+#
+#   - The unit of versioning is a release TAG, not a tracked commit.
+#   - The mirror copies the upstream verbatim (no selective import[]).
+#   - Large binaries (.gds and friends) get LFS treatment per
+#     mirror.lfs.patterns in upstream.yaml.
+#   - Tag mirroring: the mirror's sync commit is tagged with the same
+#     upstream version (e.g., 'v1.2.3'), so downstream consumers can
+#     `git checkout <version>` against the mirror and get the verbatim
+#     file tree at that release.
+#
+# Where this lives long-term:
+#   vyges-ip/.github/.github/workflows/upstream-sync-vendor-drop.yml
+# Per-mirror shim then delegates:
+#   jobs:
+#     sync:
+#       uses: vyges-ip/.github/.github/workflows/upstream-sync-vendor-drop.yml@main
+#       permissions:
+#         contents: write
+#
+# Currently lives in vyges-ip-internal/upstream/templates/ for review.
+# Promote to vyges-ip/.github via a separate PR when ready.
+
+on:
+  workflow_call:
+    inputs:
+      force:
+        description: 'Force re-sync even if upstream.commit already matches the resolved version tag'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout this mirror
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Install yq, git-lfs, rsync
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-lfs rsync
+          git lfs install
+
+      - name: Read upstream.yaml
+        id: upstream
+        run: |
+          if [[ ! -f upstream.yaml ]]; then
+            echo "Error: upstream.yaml not found"; exit 1
+          fi
+          TYPE=$(yq eval '.upstream.type' upstream.yaml)
+          if [[ "$TYPE" != "vendor_drop" ]]; then
+            echo "Error: this reusable workflow is for vendor_drop only; got '$TYPE'"
+            echo "       Use the main upstream-sync.yml for standalone/monorepo types."
+            exit 1
+          fi
+          REPO=$(yq eval '.upstream.repo' upstream.yaml)
+          VERSION=$(yq eval '.upstream.version' upstream.yaml)
+          CURRENT_COMMIT=$(yq eval '.upstream.commit // ""' upstream.yaml)
+          MIRROR_TAGS=$(yq eval '.mirror.tags // true' upstream.yaml)
+          MIRROR_RELEASES=$(yq eval '.mirror.releases // false' upstream.yaml)
+          MIRROR_RELEASE_ASSETS=$(yq eval '.mirror.release_assets // false' upstream.yaml)
+          # LFS patterns as space-separated string (may be empty)
+          LFS_PATTERNS=$(yq eval '.mirror.lfs.patterns // [] | .[]' upstream.yaml | tr '\n' ' ')
+
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "current_commit=$CURRENT_COMMIT" >> $GITHUB_OUTPUT
+          echo "mirror_tags=$MIRROR_TAGS" >> $GITHUB_OUTPUT
+          echo "mirror_releases=$MIRROR_RELEASES" >> $GITHUB_OUTPUT
+          echo "mirror_release_assets=$MIRROR_RELEASE_ASSETS" >> $GITHUB_OUTPUT
+          echo "lfs_patterns=$LFS_PATTERNS" >> $GITHUB_OUTPUT
+
+          echo "── Sync plan ──"
+          echo "  upstream:    $REPO"
+          echo "  version:     $VERSION"
+          echo "  mirror tags: $MIRROR_TAGS"
+          echo "  mirror rel:  $MIRROR_RELEASES (assets: $MIRROR_RELEASE_ASSETS)"
+          echo "  LFS pat:     $LFS_PATTERNS"
+
+      - name: Resolve upstream version → commit
+        id: resolve
+        run: |
+          REPO="${{ steps.upstream.outputs.repo }}"
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          rm -rf /tmp/upstream
+          # Shallow clone, then fetch only the requested tag — minimizes data
+          # transfer when the upstream repo carries large binaries.
+          git clone --filter=blob:none --no-checkout --quiet "$REPO" /tmp/upstream
+          cd /tmp/upstream
+          if ! git fetch origin "refs/tags/${VERSION}:refs/tags/${VERSION}" --quiet 2>/dev/null; then
+            echo "Error: tag '$VERSION' not found in $REPO"
+            echo "Available tags (last 20):"
+            git ls-remote --tags origin | tail -20
+            exit 1
+          fi
+          git checkout "$VERSION" --quiet
+          RESOLVED_COMMIT=$(git rev-parse HEAD)
+
+          echo "resolved_commit=$RESOLVED_COMMIT" >> $GITHUB_OUTPUT
+          echo "Resolved $VERSION → $RESOLVED_COMMIT"
+
+          CURRENT="${{ steps.upstream.outputs.current_commit }}"
+          FORCE="${{ inputs.force }}"
+          if [[ "$CURRENT" == "$RESOLVED_COMMIT" ]] && [[ "$FORCE" != "true" ]]; then
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+            echo "Already at $RESOLVED_COMMIT — no sync needed (set inputs.force=true to override)"
+          else
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            if [[ "$FORCE" == "true" ]]; then
+              echo "Force sync requested"
+            else
+              echo "Drift detected: mirror at '$CURRENT', upstream $VERSION at '$RESOLVED_COMMIT'"
+            fi
+          fi
+
+      - name: Configure LFS tracking BEFORE mirroring files
+        if: steps.resolve.outputs.needs_sync == 'true'
+        run: |
+          LFS_PATTERNS="${{ steps.upstream.outputs.lfs_patterns }}"
+          if [[ -n "$LFS_PATTERNS" ]]; then
+            for pattern in $LFS_PATTERNS; do
+              echo "  LFS track: $pattern"
+              git lfs track "$pattern"
+            done
+            # .gitattributes will be regenerated; keep our tracking lines
+            # by staging them now (any rsync overwrite can be merged after)
+            cp .gitattributes /tmp/lfs-gitattributes-mirror
+          else
+            echo "No LFS patterns declared; skipping LFS setup"
+          fi
+
+      - name: Mirror upstream content (verbatim, preserving mirror-specific files)
+        if: steps.resolve.outputs.needs_sync == 'true'
+        run: |
+          UPSTREAM_DIR=/tmp/upstream
+
+          # Preserve mirror-specific files that must NOT be overwritten by upstream.
+          # If the upstream ships a .gitattributes, we'll merge our LFS lines back
+          # in afterward.
+          mkdir -p /tmp/mirror-preserve
+          for f in upstream.yaml vyges-metadata.json README.md .gitattributes; do
+            [[ -f "$f" ]] && cp "$f" /tmp/mirror-preserve/
+          done
+          # Preserve mirror-specific dirs
+          [[ -d .github ]] && cp -a .github /tmp/mirror-preserve/.github
+          [[ -d vyges-additions ]] && cp -a vyges-additions /tmp/mirror-preserve/vyges-additions
+          [[ -d vyges-overlays  ]] && cp -a vyges-overlays  /tmp/mirror-preserve/vyges-overlays
+
+          # Wipe everything except .git, then rsync upstream verbatim
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          rsync -a --exclude='.git/' "$UPSTREAM_DIR/" ./
+
+          # Restore mirror-specific files (overwriting any upstream collision)
+          if [[ -d /tmp/mirror-preserve ]]; then
+            for f in upstream.yaml vyges-metadata.json README.md; do
+              [[ -f "/tmp/mirror-preserve/$f" ]] && cp "/tmp/mirror-preserve/$f" "$f"
+            done
+            # Merge .gitattributes: union of upstream's (if any) and our LFS lines
+            if [[ -f /tmp/lfs-gitattributes-mirror ]]; then
+              if [[ -f .gitattributes ]]; then
+                # Upstream had its own .gitattributes; append our LFS lines (de-duped)
+                cat /tmp/lfs-gitattributes-mirror >> .gitattributes
+                sort -u .gitattributes -o .gitattributes
+              else
+                cp /tmp/lfs-gitattributes-mirror .gitattributes
+              fi
+            fi
+            [[ -d /tmp/mirror-preserve/.github          ]] && cp -a /tmp/mirror-preserve/.github          .
+            [[ -d /tmp/mirror-preserve/vyges-additions  ]] && cp -a /tmp/mirror-preserve/vyges-additions  .
+            [[ -d /tmp/mirror-preserve/vyges-overlays   ]] && cp -a /tmp/mirror-preserve/vyges-overlays   .
+          fi
+
+      - name: Migrate large blobs into LFS
+        if: steps.resolve.outputs.needs_sync == 'true'
+        run: |
+          LFS_PATTERNS="${{ steps.upstream.outputs.lfs_patterns }}"
+          if [[ -n "$LFS_PATTERNS" ]]; then
+            INCLUDE=$(echo "$LFS_PATTERNS" | tr ' ' ',')
+            # Stage everything first so migrate import sees the new files
+            git add -A
+            # Migrate matching files in the working-tree commit-to-be into LFS
+            git lfs migrate import --include="$INCLUDE" --include-ref=HEAD 2>&1 || true
+            # Re-stage in case migrate touched .gitattributes / LFS pointers
+            git add -A
+          fi
+
+      - name: Update upstream.yaml commit field (provenance)
+        if: steps.resolve.outputs.needs_sync == 'true'
+        run: |
+          RESOLVED="${{ steps.resolve.outputs.resolved_commit }}"
+          yq eval -i ".upstream.commit = \"$RESOLVED\"" upstream.yaml
+          git add upstream.yaml
+
+      - name: Commit + push sync
+        if: steps.resolve.outputs.needs_sync == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — upstream is byte-identical to current mirror"
+            exit 0
+          fi
+
+          VERSION="${{ steps.upstream.outputs.version }}"
+          RESOLVED_SHORT=$(echo "${{ steps.resolve.outputs.resolved_commit }}" | cut -c1-7)
+          git commit -m "upstream sync: ${VERSION} (${RESOLVED_SHORT})"
+          git push origin HEAD
+
+      - name: Tag mirror sync commit with upstream version
+        if: steps.resolve.outputs.needs_sync == 'true' && steps.upstream.outputs.mirror_tags == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          RESOLVED="${{ steps.resolve.outputs.resolved_commit }}"
+
+          # Skip if tag already exists on this commit (idempotent re-runs)
+          if git rev-parse "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            EXISTING_TAG_COMMIT=$(git rev-list -n 1 "${VERSION}")
+            CURRENT_HEAD=$(git rev-parse HEAD)
+            if [[ "$EXISTING_TAG_COMMIT" == "$CURRENT_HEAD" ]]; then
+              echo "Tag ${VERSION} already points at HEAD; nothing to do"
+              exit 0
+            fi
+            echo "Warning: tag ${VERSION} exists on a different commit ($EXISTING_TAG_COMMIT); skipping"
+            exit 0
+          fi
+
+          git tag -a "${VERSION}" -m "Mirror of ${{ steps.upstream.outputs.repo }} at ${VERSION} (commit ${RESOLVED})"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Mirror upstream releases (metadata + optional assets)
+        if: steps.resolve.outputs.needs_sync == 'true' && steps.upstream.outputs.mirror_releases == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_REPO="${{ steps.upstream.outputs.repo }}"
+          UPSTREAM_OWNER_REPO=$(echo "$UPSTREAM_REPO" | sed 's|https://github.com/||' | sed 's|\.git$||')
+          MIRROR_REPO="${{ github.repository }}"
+          INCLUDE_ASSETS="${{ steps.upstream.outputs.mirror_release_assets }}"
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          # Only mirror the release that matches the pinned version (avoids
+          # spurious release creation for unrelated upstream tags).
+          if ! gh release view "$VERSION" -R "$UPSTREAM_OWNER_REPO" >/dev/null 2>&1; then
+            echo "Upstream has no release named '$VERSION'; nothing to mirror"
+            exit 0
+          fi
+
+          if gh release view "$VERSION" -R "$MIRROR_REPO" >/dev/null 2>&1; then
+            echo "Mirror already has release '$VERSION'"
+          else
+            REL_JSON=$(gh release view "$VERSION" -R "$UPSTREAM_OWNER_REPO" --json name,body)
+            NAME=$(echo "$REL_JSON" | jq -r .name)
+            BODY=$(echo "$REL_JSON" | jq -r .body)
+            gh release create "$VERSION" -R "$MIRROR_REPO" --title "${NAME:-$VERSION}" --notes "${BODY:-Mirror of upstream $VERSION}" --target main || true
+          fi
+
+          if [[ "$INCLUDE_ASSETS" == "true" ]]; then
+            tmpdir=$(mktemp -d)
+            gh release download "$VERSION" -R "$UPSTREAM_OWNER_REPO" -D "$tmpdir" 2>/dev/null || true
+            for asset in "$tmpdir"/*; do
+              [[ -f "$asset" ]] && gh release upload "$VERSION" "$asset" -R "$MIRROR_REPO" --clobber || true
+            done
+            rm -rf "$tmpdir"
+          fi
