@@ -152,39 +152,41 @@ jobs:
 
           # Preserve mirror-specific files that must NOT be overwritten by upstream.
           # If the upstream ships a .gitattributes, we'll merge our LFS lines back
-          # in afterward.
+          # in afterward. Use explicit if/then because `set -e` (default for
+          # GitHub Actions bash steps) treats `[[ ]] && cmd` as failing when
+          # the conditional is false, which aborts the script.
           mkdir -p /tmp/mirror-preserve
           for f in upstream.yaml vyges-metadata.json README.md .gitattributes; do
-            [[ -f "$f" ]] && cp "$f" /tmp/mirror-preserve/
+            if [[ -f "$f" ]]; then cp "$f" /tmp/mirror-preserve/; fi
           done
           # Preserve mirror-specific dirs
-          [[ -d .github ]] && cp -a .github /tmp/mirror-preserve/.github
-          [[ -d vyges-additions ]] && cp -a vyges-additions /tmp/mirror-preserve/vyges-additions
-          [[ -d vyges-overlays  ]] && cp -a vyges-overlays  /tmp/mirror-preserve/vyges-overlays
+          if [[ -d .github          ]]; then cp -a .github          /tmp/mirror-preserve/.github;          fi
+          if [[ -d vyges-additions  ]]; then cp -a vyges-additions  /tmp/mirror-preserve/vyges-additions;  fi
+          if [[ -d vyges-overlays   ]]; then cp -a vyges-overlays   /tmp/mirror-preserve/vyges-overlays;   fi
 
           # Wipe everything except .git, then rsync upstream verbatim
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
           rsync -a --exclude='.git/' "$UPSTREAM_DIR/" ./
 
           # Restore mirror-specific files (overwriting any upstream collision)
-          if [[ -d /tmp/mirror-preserve ]]; then
-            for f in upstream.yaml vyges-metadata.json README.md; do
-              [[ -f "/tmp/mirror-preserve/$f" ]] && cp "/tmp/mirror-preserve/$f" "$f"
-            done
-            # Merge .gitattributes: union of upstream's (if any) and our LFS lines
-            if [[ -f /tmp/lfs-gitattributes-mirror ]]; then
-              if [[ -f .gitattributes ]]; then
-                # Upstream had its own .gitattributes; append our LFS lines (de-duped)
-                cat /tmp/lfs-gitattributes-mirror >> .gitattributes
-                sort -u .gitattributes -o .gitattributes
-              else
-                cp /tmp/lfs-gitattributes-mirror .gitattributes
-              fi
+          for f in upstream.yaml vyges-metadata.json README.md; do
+            if [[ -f "/tmp/mirror-preserve/$f" ]]; then
+              cp "/tmp/mirror-preserve/$f" "$f"
             fi
-            [[ -d /tmp/mirror-preserve/.github          ]] && cp -a /tmp/mirror-preserve/.github          .
-            [[ -d /tmp/mirror-preserve/vyges-additions  ]] && cp -a /tmp/mirror-preserve/vyges-additions  .
-            [[ -d /tmp/mirror-preserve/vyges-overlays   ]] && cp -a /tmp/mirror-preserve/vyges-overlays   .
+          done
+          # Merge .gitattributes: union of upstream's (if any) and our LFS lines
+          if [[ -f /tmp/lfs-gitattributes-mirror ]]; then
+            if [[ -f .gitattributes ]]; then
+              # Upstream had its own .gitattributes; append our LFS lines (de-duped)
+              cat /tmp/lfs-gitattributes-mirror >> .gitattributes
+              sort -u .gitattributes -o .gitattributes
+            else
+              cp /tmp/lfs-gitattributes-mirror .gitattributes
+            fi
           fi
+          if [[ -d /tmp/mirror-preserve/.github          ]]; then cp -a /tmp/mirror-preserve/.github          .; fi
+          if [[ -d /tmp/mirror-preserve/vyges-additions  ]]; then cp -a /tmp/mirror-preserve/vyges-additions  .; fi
+          if [[ -d /tmp/mirror-preserve/vyges-overlays   ]]; then cp -a /tmp/mirror-preserve/vyges-overlays   .; fi
 
       - name: Migrate large blobs into LFS
         if: steps.resolve.outputs.needs_sync == 'true'
