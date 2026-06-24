@@ -215,6 +215,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Stage ALL mirrored content. The LFS-migrate step only runs `git add -A`
+          # when LFS patterns are declared; without it the verbatim files would be
+          # untracked and the commit below would capture only upstream.yaml. This
+          # unconditional add is idempotent w.r.t. the LFS path.
+          git add -A
+
           if git diff --cached --quiet; then
             echo "Nothing to commit — upstream is byte-identical to current mirror"
             exit 0
