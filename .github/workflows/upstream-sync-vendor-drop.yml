@@ -184,9 +184,17 @@ jobs:
               cp /tmp/lfs-gitattributes-mirror .gitattributes
             fi
           fi
-          if [[ -d /tmp/mirror-preserve/.github          ]]; then cp -a /tmp/mirror-preserve/.github          .; fi
-          if [[ -d /tmp/mirror-preserve/vyges-additions  ]]; then cp -a /tmp/mirror-preserve/vyges-additions  .; fi
-          if [[ -d /tmp/mirror-preserve/vyges-overlays   ]]; then cp -a /tmp/mirror-preserve/vyges-overlays   .; fi
+          # Restore mirror-owned dirs as a CLEAN REPLACE (rm then copy), NOT a merge.
+          # `cp -a src .` when ./src already exists from rsync nests into ./src/src and
+          # leaves upstream files in place — notably upstream .github/workflows/*, which
+          # the Actions GITHUB_TOKEN cannot push (needs `workflows` permission) and which
+          # we never want in a mirror anyway. Wipe-then-copy keeps only the mirror's own.
+          for d in .github vyges-additions vyges-overlays; do
+            if [[ -d "/tmp/mirror-preserve/$d" ]]; then
+              rm -rf "./$d"
+              cp -a "/tmp/mirror-preserve/$d" "./$d"
+            fi
+          done
 
       - name: Migrate large blobs into LFS
         if: steps.resolve.outputs.needs_sync == 'true'
