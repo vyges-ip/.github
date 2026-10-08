@@ -116,6 +116,23 @@ jobs:
             UP_PATH=$(yq eval ".import.rtl[$i].path" upstream.yaml)
             LOCAL_PATH=$(yq eval ".import.rtl[$i].map_to" upstream.yaml)
             echo "Syncing RTL: $UP_PATH -> $LOCAL_PATH"
+            # A single-file entry (e.g. src/tc_pwr.sv -> rtl/tc_pwr.sv) is copied to its
+            # map_to path, or into map_to when that is an existing directory or ends in '/'.
+            # Directories fall through to the contents copy below.
+            SRC_FILE=""
+            for CAND in "$SRC_BASE/$UP_PATH" "/tmp/upstream/$UP_PATH"; do
+              if [[ -f "$CAND" ]]; then SRC_FILE="$CAND"; break; fi
+            done
+            if [[ -n "$SRC_FILE" ]]; then
+              if [[ -d "$LOCAL_PATH" || "$LOCAL_PATH" == */ ]]; then
+                mkdir -p "$LOCAL_PATH"
+                cp "$SRC_FILE" "$LOCAL_PATH/"
+              else
+                mkdir -p "$(dirname "$LOCAL_PATH")"
+                cp "$SRC_FILE" "$LOCAL_PATH"
+              fi
+              continue
+            fi
             mkdir -p "$LOCAL_PATH"
             if [[ "$UPSTREAM_TYPE" == "monorepo" ]]; then
               cp -r "$SRC_BASE/$UP_PATH"/* "$LOCAL_PATH/" 2>/dev/null || \
